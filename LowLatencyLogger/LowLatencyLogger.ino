@@ -17,6 +17,10 @@
 #include "SdFat.h"
 #include "FreeStack.h"
 #include "UserTypes.h"
+/* .ino file compilation seems to require this here even though it
+  isnt used */
+#include "mlx90621.h" 
+
 
 #ifdef __AVR_ATmega328P__
 #include "MinimumSerial.h"
@@ -30,7 +34,8 @@ MinimumSerial MinSerial;
 #define ABORT_ON_OVERRUN 1
 //------------------------------------------------------------------------------
 //Interval between data records in microseconds.
-const uint32_t LOG_INTERVAL_USEC = 2000;
+// log interval hz: 3906.25=256, 7812.5 = 128, 15625 = 64, 31250 = 32
+const uint32_t LOG_INTERVAL_USEC = 15625;
 //------------------------------------------------------------------------------
 // Set USE_SHARED_SPI non-zero for use of an SPI sensor.
 // May not work for some cards.
@@ -41,7 +46,7 @@ const uint32_t LOG_INTERVAL_USEC = 2000;
 // Pin definitions.
 //
 // SD chip select pin.
-const uint8_t SD_CS_PIN = SS;
+const uint8_t SD_CS_PIN = PIN_SS;
 //
 // Digital pin to indicate an error, set to -1 if not used.
 // The led blinks for fatal errors. The led goes on solid for
@@ -50,7 +55,7 @@ const uint8_t SD_CS_PIN = SS;
 #ifdef ERROR_LED_PIN
 #undef ERROR_LED_PIN
 #endif  // ERROR_LED_PIN
-const int8_t ERROR_LED_PIN = -1;
+const int8_t ERROR_LED_PIN = PIN_ERROR_LED;
 //------------------------------------------------------------------------------
 // File definitions.
 //
@@ -306,13 +311,7 @@ void dumpData() {
   }
   Serial.println(F("Done"));
 }
-//------------------------------------------------------------------------------
-// log data
-void logData() {
-  createBinFile();
-  recordBinFile();
-  renameBinFile();
-}
+
 //------------------------------------------------------------------------------
 void openBinFile() {
   char name[FILE_NAME_DIM];
@@ -388,10 +387,15 @@ void recordBinFile() {
   uint32_t overrun = 0;
   uint32_t overrunTotal = 0;
   uint32_t logTime = micros();
+
+  /* light LED to indicate writing */
+  if (ERROR_LED_PIN >= 0) {
+      digitalWrite(ERROR_LED_PIN, HIGH);
+  }
   while(1) {
      // Time for next data record.
     logTime += LOG_INTERVAL_USEC;
-    if (Serial.available()) {
+    if (Serial.available() || ( !Serial && SWITCH_RECORD_OFF) ) {
       closeFile = true;
     }
     if (closeFile) {
@@ -470,6 +474,10 @@ void recordBinFile() {
       }
     }
   }
+  /* disable write LED */
+  if (ERROR_LED_PIN >= 0) {
+      digitalWrite(ERROR_LED_PIN, LOW);
+  }  
   if (!sd.card()->writeStop()) {
     error("writeStop failed");
   }
@@ -486,6 +494,28 @@ void recordBinFile() {
       error("Can't truncate file");
     }
   }
+}
+//-----------------------------------------------------------------------------
+void renameBinFile() {
+  while (sd.exists(binName)) {
+    if (binName[BASE_NAME_SIZE + 1] != '9') {
+      binName[BASE_NAME_SIZE + 1]++;
+    } else {
+      binName[BASE_NAME_SIZE + 1] = '0';
+      if (binName[BASE_NAME_SIZE] == '9') {
+        error("Can't create file name");
+      }
+      binName[BASE_NAME_SIZE]++;
+    }
+  }
+  if (!binFile.rename(binName)) {
+    error("Can't rename file");
+    }
+  Serial.print(F("File renamed: "));
+  Serial.println(binName);
+  Serial.print(F("File size: "));
+  Serial.print(binFile.fileSize()/512);
+  Serial.println(F(" blocks"));
 }
 //------------------------------------------------------------------------------
 void recoverTmpFile() {
@@ -516,27 +546,12 @@ void recoverTmpFile() {
   }
   renameBinFile();
 }
-//-----------------------------------------------------------------------------
-void renameBinFile() {
-  while (sd.exists(binName)) {
-    if (binName[BASE_NAME_SIZE + 1] != '9') {
-      binName[BASE_NAME_SIZE + 1]++;
-    } else {
-      binName[BASE_NAME_SIZE + 1] = '0';
-      if (binName[BASE_NAME_SIZE] == '9') {
-        error("Can't create file name");
-      }
-      binName[BASE_NAME_SIZE]++;
-    }
-  }
-  if (!binFile.rename(binName)) {
-    error("Can't rename file");
-    }
-  Serial.print(F("File renamed: "));
-  Serial.println(binName);
-  Serial.print(F("File size: "));
-  Serial.print(binFile.fileSize()/512);
-  Serial.println(F(" blocks"));
+//------------------------------------------------------------------------------
+// log data
+void logData() {
+  createBinFile();
+  recordBinFile();
+  renameBinFile();
 }
 //------------------------------------------------------------------------------
 void testSensor() {
@@ -562,10 +577,11 @@ void setup(void) {
   if (ERROR_LED_PIN >= 0) {
     pinMode(ERROR_LED_PIN, OUTPUT);
   }
+  pinMode(PIN_SWITCH_INPUT, INPUT); /* physical record switch */
   Serial.begin(9600);
 
   // Wait for USB Serial
-  while (!Serial) {
+  while (!Serial && SWITCH_RECORD_OFF ) {
     SysCall::yield();
   }
   Serial.print(F("\nFreeStack: "));
@@ -616,7 +632,7 @@ void loop(void) {
   Serial.println(F("l - list files"));
   Serial.println(F("r - record data"));
   Serial.println(F("t - test without logging"));
-  while(!Serial.available()) {
+  while(!Serial.available() && SWITCH_RECORD_OFF ) {
     SysCall::yield();
   }
 #if WDT_YIELD_TIME_MICROS
@@ -624,7 +640,13 @@ void loop(void) {
   SysCall::halt();
 #endif
 
-  char c = tolower(Serial.read());
+  char c;
+  if ( SWITCH_RECORD_ON ){
+    c = 'r';
+  }
+  else {
+    c = tolower(Serial.read());
+  }
 
   // Discard extra Serial data.
   do {
